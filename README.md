@@ -2,6 +2,10 @@
 
 **Middleware API for astronomical telescope systems** - Acts as a single point of access for multiple telemetry tools and systems used in astronomical research, providing intelligent caching, protocol abstraction, and unified access to diverse astronomical equipment.
 
+**TO DO LIST:**
+- poprawić resources lock
+- dodać obsługę błędów
+
 ## OCABox Project Family
 
 This repository is part of the **OCABox ecosystem** - a comprehensive suite of tools for astronomical telescope control:
