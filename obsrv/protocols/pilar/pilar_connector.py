@@ -52,7 +52,6 @@ class PilarConnector(Connector):
         self._connected = False
         logger.info(f'Pilar advanced connector created')
 
-    # ZMIANA: Całkowicie nowa logika wczytywania konfiguracji
     def _load_config(self):
         logger.info(f"Loading Pilar configuration from: {CONFIG_PATH}")
         try:
@@ -69,14 +68,11 @@ class PilarConnector(Connector):
                 "pool_get": config['settings']['timeouts']['pool_get'].get(float),
             }
 
-            # Wczytywanie blokad zasobów (bez zmian)
             self._resource_lock_map = config['resource_locks'].get(dict)
 
-            # Inicjalizacja pustych słowników na mapowania i akcje
             self._command_map = {}
             self._actions_map = {}
 
-            # Iteracja przez wszystkie zdefiniowane komponenty
             if 'components' in config:
                 for component_name, component_config in config['components'].get().items():
                     if 'mappings' in component_config:
