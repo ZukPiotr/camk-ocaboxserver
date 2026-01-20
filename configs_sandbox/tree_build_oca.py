@@ -5,6 +5,9 @@ try:
     from obsrv.tree_components.base_components.tree_base_broker_default_target import TreeBaseBrokerDefaultTarget
     from obsrv.tree_components.base_components.tree_provider import TreeProvider
     from obsrv.tree_components.specialized_components.tree_alpaca import TreeAlpacaObservatory
+    # Import dedykowanej klasy dla IRIS
+    from obsrv.tree_components.specialized_components.tree_iris import TreeIrisObservatory
+    
     from obsrv.tree_components.specialized_components import TreeBaseRequestBlocker
     from obsrv.tree_components.specialized_components import TreeBlockerAccessGrantor
     from obsrv.tree_components.specialized_components import TreeCache
@@ -14,13 +17,19 @@ try:
     from obsrv.tree_components.specialized_components.tree_plan_executor import TreePlanExecutor
 except ImportError:
     import logging
-    logging.warning("tree_build: TIC version 1, consider upgrade to version 2. Falling back to old import paths")
+    logging.warning("tree_build: Import fallback initiated.")
     from obsrv.comunication.request_solver import RequestSolver
     from obsrv.comunication.router import Router
     from obsrv.data_colection.base_components.tree_base_broker import TreeBaseBroker
     from obsrv.data_colection.base_components.tree_base_broker_default_target import TreeBaseBrokerDefaultTarget
     from obsrv.data_colection.base_components.tree_provider import TreeProvider
     from obsrv.data_colection.specialistic_components.tree_alpaca import TreeAlpacaObservatory
+    # Fallback dla starej struktury katalogów
+    try:
+        from obsrv.data_colection.specialistic_components.tree_iris import TreeIrisObservatory
+    except ImportError:
+        pass
+
     from obsrv.data_colection.specialistic_components.tree_base_request_blocker import TreeBaseRequestBlocker
     from obsrv.data_colection.specialistic_components.tree_blocker_access_grantor import TreeBlockerAccessGrantor
     from obsrv.data_colection.specialistic_components.tree_cache_observatory import TreeCache
@@ -93,8 +102,11 @@ def tree_build() -> Router:
     target_provider_wg25 = TreeProvider('target-provider-wg25', 'wg25', conditional_freezer_wg25)
 
     # --------------------------------------- iris ---------------------------------------
-    alpaca_iris = TreeAlpacaObservatory('alpaca-iris', observatory_name='iris')
-    alpaca_blocker_iris = TreeBaseRequestBlocker('alpaca-blocker-iris', alpaca_iris)
+    # Tutaj używamy nowej klasy obsługującej mieszane protokoły (Pilar + IrisCCD + Alpaca)
+    iris_observatory = TreeIrisObservatory('iris-observatory', observatory_name='iris')
+    
+    # Przekazujemy iris_observatory dalej do blokerów i brokerów
+    alpaca_blocker_iris = TreeBaseRequestBlocker('alpaca-blocker-iris', iris_observatory)
     blocker_grantor_iris = TreeBlockerAccessGrantor('access-grantor-iris', 'access_grantor', alpaca_blocker_iris)
     plan_executor_iris = TreePlanExecutor('executor-iris', 'executor')
     broker_components_iris = TreeBaseBrokerDefaultTarget('broker-components-iris',
@@ -135,7 +147,7 @@ def tree_build() -> Router:
                                        target_provider_zb08,
                                        target_provider_jk15,
                                        target_provider_wg25,
-                                       target_provider_iris,
+                                       target_provider_iris, # Dodajemy provider dla IRIS
                                        target_provider_sim,
                                        target_provider_dev,
                                        target_provider_global])

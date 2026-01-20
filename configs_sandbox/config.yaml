@@ -850,45 +850,53 @@ tree:
   iris:
     observatory:
       comment: IRIS InfraRed Imaging System 0.8m Telescope
-      flags: [ 'disabled' ] # telescope is disabled
-      lon: -70.20116    # Stefan
+      flags: [ 'production' ]
+      lon: -70.20116
       lat: -24.59852
-      elev: 2817  # m      protocol: alpaca
+      elev: 2817
       epoch: 2000
-      address: http://iris-tcu.oca.lan:11111/api/v1
-      style: { color: '#FF2F13' }  # red
+      # Usuwamy globalne 'protocol: alpaca' i 'address'
+      style: { color: '#FF2F13' }
       components:
         mount:
           kind: telescope
           device_number: 0
+          protocol: pilar           # <--- PILAR
+          address: iris-tcu.oca.lan:5950
           type: az
           slew_timeout: 120
         derotator:
           kind: rotator
           device_number: 0
-        derotator_f2:
-          kind: rotator
-          device_number: 1
+          protocol: pilar           # <--- PILAR
+          address: iris-tcu.oca.lan:5950
         focuser:
           kind: focuser
           device_number: 0
+          protocol: pilar           # <--- PILAR
+          address: iris-tcu.oca.lan:5950
         dome:
           kind: dome
           device_number: 0
+          protocol: alpaca          
+          address: http://iris-dome.oca.lan:11111/api/v1 # Adres sterownika kopuły
           slew_timeout: 120
         covercalibrator:
           kind: covercalibrator
           device_number: 0
+          protocol: pilar           # <--- PILAR
+          address: iris-tcu.oca.lan:5950
         camera:
           kind: camera
           device_number: 0
+          protocol: iris_ccd        # <--- IRIS CCD
+          address: iris-ccd.oca.lan:8888
         filterwheel:
           kind: filterwheel
           device_number: 0
+          protocol: iris_ccd        # <--- IRIS CCD
+          address: iris-ccd.oca.lan:8888
           filters: {}  # optional
-        switch:
-          kind: switch
-          device_number: 0
         safetymonitor:
           kind: safetymonitor
           device_number: 0
