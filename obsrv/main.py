@@ -12,7 +12,6 @@ import signal
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] [%(name)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger('main')
 
-
 # config najpierw z ob/config.yaml potem z configuration.config.yaml
 # taka wartośc w env dla build file OCABOX_BUILD_FILE_NAME
 
@@ -95,7 +94,8 @@ def main(argv=None):
 
     def ask_exit():
         raise KeyboardInterrupt
-    loop.add_signal_handler(signal.SIGINT, ask_exit)
+    if sys.platform != 'win32':
+        loop.add_signal_handler(signal.SIGINT, ask_exit)
 
     try:
         asyncio.set_event_loop(loop)

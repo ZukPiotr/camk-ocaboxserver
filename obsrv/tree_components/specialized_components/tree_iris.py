@@ -38,7 +38,7 @@ class TreeIrisObservatory(TreeBaseProvider):
         hard_default = 0.8
         timeout_multiplier = self._get_cfg("timeout_multiplier", hard_default)
         if not (0 < timeout_multiplier < 1):
-            logger.warning(f"Can not set timeout_multiplier {timeout_multiplier}. Should be greater than 0 and lover "
+            logger.warning(f"Can not set timeout_multiplier {timeout_multiplier}. Should be greater than 0 and lower "
                           f"than 1. Will be set to default value: {hard_default}")
             timeout_multiplier = hard_default
         return timeout_multiplier
