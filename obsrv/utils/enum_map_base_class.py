@@ -36,5 +36,3 @@ class StrVal(str, BaseArgsMap):
 
     def val(self):
         return self._VAL_
-
-

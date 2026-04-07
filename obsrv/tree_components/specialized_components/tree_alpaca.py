@@ -124,4 +124,3 @@ class TreeAlpacaObservatory(TreeBaseProvider):
             out.get(self.get_name()).get("config").update({"observatory_config": obs_cfg})
             out.get(self.get_name()).get("config").update({"observatory_config_name": self.observatory_name})
         return out
-

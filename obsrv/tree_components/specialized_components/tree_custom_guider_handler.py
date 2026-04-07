@@ -30,4 +30,3 @@ class TreeCustomGuiderHandler(TreeProvider):
         # deprecated
 
         raise AddressError(code=1002, message=f'Deprecated module {self.get_name()}')
-

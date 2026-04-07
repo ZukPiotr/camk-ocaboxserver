@@ -1,3 +1,5 @@
+#By default this file was called tree_build_example.py
+
 try:
     from obsrv.communication.request_solver import RequestSolver
     from obsrv.communication.router import Router
