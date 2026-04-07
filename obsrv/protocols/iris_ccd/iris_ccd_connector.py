@@ -8,7 +8,7 @@ from obsrv.protocols.alpaca.alpaca_connector import Connector
 
 logger = logging.getLogger(__name__.rsplit('.')[-1])
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'iris_ccd_config.yaml')
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'iris_ccd_config.yml')
 
 class IrisCcdProtocol(asyncio.DatagramProtocol):
     def __init__(self, response_future: asyncio.Future):
@@ -104,8 +104,10 @@ class IrisCcdConnector(Connector):
                 response = data.split(b'\0', 1)[0].decode('utf-8')
                 logger.debug(f"IRIS CCD IN ({address}) <<< {response}")
 
-                if response.startswith("**** OKAY"):
-                    return response[10:].strip()
+                if "OKAY" in response:
+                    # Znajdujemy pozycję słowa OKAY i zwracamy wszystko, co po nim występuje
+                    index = response.find("OKAY")
+                    return response[index + 4:].strip()
                 else:
                     raise RuntimeError(f"IRIS CCD error: {response}")
 
@@ -132,7 +134,30 @@ class IrisCcdConnector(Connector):
                 command = f"{command_base} {get_arg}"
             else:
                 command = command_base
-            return await self._execute_command(address, command)
+            
+            # 1. Pobieramy surowy tekst z kamery
+            raw_response = await self._execute_command(address, command)
+            
+            # 2. TŁUMACZENIE STANU KAMERY NA STANDARD ALPACA
+            if component.kind == 'camera' and variable == 'camerastate':
+                resp_upper = raw_response.upper()
+                if "EXPOS" in resp_upper:
+                    return 2  # CameraExposing
+                elif "WAIT" in resp_upper:
+                    return 1  # CameraWaiting
+                elif "READ" in resp_upper:
+                    return 3  # CameraReading
+                elif "DOWNLOAD" in resp_upper:
+                    return 4  # CameraDownload
+                elif "ERROR" in resp_upper or "FAIL" in resp_upper:
+                    return 5  # CameraError
+                else:
+                    # Dla "OK" i wszelkich innych statusów spoczynkowych
+                    return 0  # CameraIdle
+            
+            # 3. Zwracamy odpowiedź (jeśli to nie jest camerastate, zwróci tekst)
+            return raw_response
+            
         except (KeyError, TimeoutError, ConnectionError, RuntimeError) as e:
             logger.error(f"IRIS CCD GET failed for {component.kind}.{variable}: {e}")
             return None
@@ -145,6 +170,8 @@ class IrisCcdConnector(Connector):
         try:
             command_def = self._command_map[component.kind][variable]
             command_base = command_def['command']
+            if not data:
+                return {"status": "failed", "error": "Missing input value."}
             value = list(data.values())[0]
             command = f"{command_base} {value}"
             response = await self._execute_command(address, command)

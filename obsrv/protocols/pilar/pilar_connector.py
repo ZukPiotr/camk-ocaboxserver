@@ -10,7 +10,7 @@ from obcom.data_colection.address import AddressError
 
 logger = logging.getLogger(__name__.rsplit('.')[-1])
 
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'pilar_config.yaml')
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'pilar_config.yml')
 
 class PilarConnection:
     """Reprezentuje pojedyncze, aktywne połączenie TCP z serwerem Pilar."""
@@ -35,8 +35,21 @@ class PilarConnection:
             
             # Sprawdzamy czy odpowiedź dotyczy naszego ID
             if response_line.startswith(f"{cmd_id} "):
+                
+                # Znak = oznacza, że dostaliśmy wartość
                 if "=" in response_line:
-                    value_to_return = response_line.split("=", 1)[1].strip()
+                    value_str = response_line.split("=", 1)[1].strip()
+                    # Próba konwersji tekstu na liczbę musi być pod if "="
+                    try:
+                        if '.' in value_str:
+                            value_to_return = float(value_str)
+                        else:
+                            value_to_return = int(value_str)
+                    except ValueError:
+                        # Jeśli to nie liczba, zostaw jako tekst
+                        value_to_return = value_str
+                        
+                # Rozpoznajemy status zakończenia komendy
                 if "COMMAND COMPLETE" in response_line:
                     return value_to_return if value_to_return is not None else "OK"
                 if "COMMAND FAILED" in response_line:
@@ -222,6 +235,8 @@ class PilarConnector(Connector):
 
         try:
             pilar_cmd = self._command_map[component.kind][variable]
+            if not data:
+                return {"status": "failed", "error": "Missing input value."}
             value = list(data.values())[0]
             command = f"SET {pilar_cmd}={value}"
             
