@@ -1,7 +1,7 @@
 
 import logging
 import time
-from typing import Dict
+from typing import Awaitable, Callable, Dict, List, Optional
 
 from obcom.data_colection.address import AddressError
 from obsrv.tree_components.base_components.tree_base_provider import TreeBaseProvider
@@ -10,6 +10,7 @@ from obcom.data_colection.coded_error import TreeStructureError, TreeOtherError
 from obcom.data_colection.tree_user import BaseTreeUser, TreeServiceUser
 from obcom.data_colection.value import Value
 from obcom.data_colection.value_call import ValueRequest
+from obsrv.utils.observable import Observable
 
 logger = logging.getLogger(__name__.rsplit('.')[-1])
 
@@ -18,10 +19,15 @@ class TreeBaseRequestBlocker(TreeBaseProvider):
     """
     This is a module for filtering and blocking some type incoming requests. In order to unlock access, access must
     be reserved by the user for a certain period of time. Reservation is done using a different module.
+
+    Additionally provides a safety cutoff switch that blocks dangerous commands (movement, dome, mirror covers)
+    when engaged. The cutoff cannot be bypassed by the special permission parameter or white lists — only by
+    the dedicated safety cutoff bypass parameter intended for manual control devices operated inside the dome.
     """
 
     COMPONENT_DEFAULT_NAME: str = 'TreeBaseRequestBlocker'
     SPECIAL_PERMISSION_PARAM: str = "request_special_permission_param"  # use only for requesting inside ocabox
+    SAFETY_CUTOFF_BYPASS_PARAM: str = "request_safety_cutoff_bypass_param"  # for manual dome controllers
 
     def __init__(self, component_name: str, subcontractor: ProvidesResponseProtocol = None, **kwargs):
         super().__init__(component_name=component_name, subcontractor=subcontractor, **kwargs)
@@ -31,7 +37,14 @@ class TreeBaseRequestBlocker(TreeBaseProvider):
                                               'PUT': []}
         self._white_lists: Dict[str, list] = {'GET': [],
                                               'PUT': []}
+        # Observable so subscribers (e.g. TreeBlockerAccessGrantor.safety_cutoff_state)
+        # can wake within an event-loop tick of state changes rather than within
+        # t_tolerance. ``_safety_cutoff_list`` stays plain — it's loaded once from
+        # config and not mutated at runtime.
+        self._safety_cutoff_engaged: Observable[bool] = Observable(False)
+        self._safety_cutoff_list: List[str] = []
         self._init_lists_of_special_requests()
+        self._init_safety_cutoff_list()
 
     async def get_value(self, request: ValueRequest, **kwargs) -> Value or None:
         # docstring is importing from parent
@@ -46,13 +59,20 @@ class TreeBaseRequestBlocker(TreeBaseProvider):
         if request.request_type != 'PUT':
             raise TreeOtherError(code=4001, message='Unrecognized request type')
 
+        # safety cutoff — blocks dangerous commands when engaged, only bypassable by dedicated param
+        if self._safety_cutoff_engaged.get() and self._is_cutoff_blocked(request=request):
+            if not self._check_has_safety_cutoff_bypass(request=request):
+                command = '.'.join(request.address[request.index:])
+                raise AddressError(code=1005,
+                                   message=f'Safety cutoff is engaged — command \'{command}\' blocked for dome entry safety')
+
         # white list always can go ahead
         if self._check_white_list(request=request):
             raise TreeStructureError
 
-        # request witch special flag - can go ahead
+        # request with special flag - can go ahead
         # from 2.1.0 TreeServiceUser is no longer required to bypass the blocker
-        if self._check_has_param(request=request):  # and isinstance(request.user, TreeServiceUser):
+        if self._check_has_param(request=request):
             logger.debug("Retrieved a message with a flag was bypassing the TreeBaseRequestBlocker")
             raise TreeStructureError
 
@@ -173,6 +193,64 @@ class TreeBaseRequestBlocker(TreeBaseProvider):
     def _check_has_param(self, request: ValueRequest) -> bool:
         param = request.request_data.get(self.SPECIAL_PERMISSION_PARAM, None)
         return param is not None and isinstance(param, bool) and param
+
+    # --- Safety cutoff ---
+
+    def engage_safety_cutoff(self):
+        """Engage the safety cutoff switch, blocking all dangerous commands."""
+        self._safety_cutoff_engaged.set(True)
+        logger.info(f"Safety cutoff ENGAGED on {self.get_name()}")
+
+    def disengage_safety_cutoff(self):
+        """Disengage the safety cutoff switch, restoring normal operation."""
+        self._safety_cutoff_engaged.set(False)
+        logger.info(f"Safety cutoff DISENGAGED on {self.get_name()}")
+
+    def is_safety_cutoff_engaged(self) -> bool:
+        """Return whether the safety cutoff switch is currently engaged."""
+        return self._safety_cutoff_engaged.get()
+
+    def get_safety_cutoff_list(self) -> List[str]:
+        """Return the list of commands/addresses blocked when safety cutoff is engaged."""
+        return list(self._safety_cutoff_list)
+
+    def subscribe_safety_cutoff_change(
+        self, watcher: Callable[[bool], Optional[Awaitable[None]]]
+    ) -> Callable[[], None]:
+        """Register a watcher fired when ``safety_cutoff_engaged`` toggles.
+
+        Returned callable unsubscribes (idempotent). Used by
+        ``TreeBlockerAccessGrantor`` to wake cycle-query subscribers
+        of ``safety_cutoff_state`` within an event-loop tick of the
+        engage/disengage call.
+        """
+        return self._safety_cutoff_engaged.subscribe(watcher)
+
+    def _is_cutoff_blocked(self, request: ValueRequest) -> bool:
+        """Check if the request targets a command blocked by the safety cutoff.
+
+        Matching rules:
+            - Entry without a dot matches the last segment of the address (command name).
+            - Entry with a dot matches the full relative address exactly.
+        """
+        adr = '.'.join(request.address[request.index:])
+        command = adr.rsplit('.', 1)[-1]
+        for pattern in self._safety_cutoff_list:
+            if '.' in pattern:
+                if adr == pattern:
+                    return True
+            else:
+                if command == pattern:
+                    return True
+        return False
+
+    def _check_has_safety_cutoff_bypass(self, request: ValueRequest) -> bool:
+        param = request.request_data.get(self.SAFETY_CUTOFF_BYPASS_PARAM, None)
+        return param is not None and isinstance(param, bool) and param
+
+    def _init_safety_cutoff_list(self):
+        """Load the safety cutoff command list from configuration."""
+        self._safety_cutoff_list = list(self._get_cfg('safety_cutoff_list', []))
 
 
 class ReservationError(Exception):

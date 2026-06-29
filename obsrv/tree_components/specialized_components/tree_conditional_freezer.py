@@ -16,6 +16,32 @@ from obsrv.utils.asyncio_util_functions import wait_for_psce
 logger = logging.getLogger(__name__.rsplit('.')[-1])
 
 
+# Cyclic-query bookkeeping fields stamped into `request.request_data` by
+# the client (obcom.cycle_query) and consumed by the freezer below. They
+# are tree-internal state and must NOT be forwarded to protocol connectors
+# — at least one ASCOM driver in production (jk15-tcu) rejects unknown URL
+# params with HTTP 400, which then permanently freezes the cache at the
+# last successful value (e.g. camera.state stuck at EXPOSING for hours).
+TREE_INTERNAL_REQUEST_FIELDS = frozenset({
+    'time_of_known_change',
+    'no_send_before',
+    'nr_of_unsuccessful_refreshes',
+})
+
+
+def strip_tree_internal_fields(request_arguments: dict) -> dict:
+    """Return request_arguments with cyclic-query bookkeeping fields removed.
+
+    No-op (returns the same dict) when nothing leaks; otherwise returns a
+    fresh dict so the caller's input is not mutated.
+    """
+    if not request_arguments:
+        return request_arguments
+    if not TREE_INTERNAL_REQUEST_FIELDS.intersection(request_arguments):
+        return request_arguments
+    return {k: v for k, v in request_arguments.items() if k not in TREE_INTERNAL_REQUEST_FIELDS}
+
+
 # todo zapytać  o podwojne zapytania do rutera, jedna wartość może się zmienić szybciej nisz druga i co wtedy?
 #  Zdajemy się na inteligęcje urzytkownika? może niech będzie taka opcja ale w client_API się to uniemożliwi?
 
@@ -48,7 +74,8 @@ class TreeConditionalFreezer(TreeBaseProvider):
         # check request is cachable
         if not self._subcontractor.is_cachable_request(request=request):
             logger.info(f'Retrieve a cycle query for a non-cacheable value {request.address}')
-            raise TreeOtherError(code=4003)
+            # Permanent under current server config — no_cachable_regex is config, not state.
+            raise TreeOtherError(code=4003, severity=ResponseError.SEVERITY_CRITICAL)
 
         time_of_known_change = request.request_data.get('time_of_known_change', None)
         t_tolerance = request.time_of_data_tolerance
@@ -97,6 +124,11 @@ class TreeConditionalFreezer(TreeBaseProvider):
             # whether the number of re-refreshes has been exceeded
             if nr_of_unsuccessful_refreshes >= self._max_unsuccessful_refreshes:
                 logger.info(f'Too many failed attempts to refresh a value {request.address}')
+                # ``severity=None`` resolves to ``SEVERITY_NORMAL`` via the ResponseError
+                # constructor — used when no underlying connector error supplied a
+                # severity (e.g. a connector that swallowed the exception and returned
+                # None). Connectors MUST surface real errors with explicit severity so
+                # this fallback is reached only for legitimate "no signal at all" cases.
                 raise TreeValueError(code=2003, severity=highest_update_error_severity)
 
             await asyncio.sleep(0)  # let other tasks do work

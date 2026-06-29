@@ -1,5 +1,6 @@
 import logging
 import time
+from typing import Awaitable, Callable, ClassVar, List, Optional
 
 from obcom.data_colection.address import AddressError
 from obsrv.tree_components.base_components.tree_provider import TreeProvider
@@ -23,13 +24,31 @@ class TreeBlockerAccessGrantor(TreeProvider):
         - current_user - this command return current user witch one is currently accessing
         - timeout_current_control - this command return timeout for currently accessing user
         - is_access - this method checks if the requesting user has control and return True if so
+        - engage_safety_cutoff - engage the safety cutoff switch blocking dangerous commands
+        - disengage_safety_cutoff - disengage the safety cutoff switch restoring normal operation
+        - safety_cutoff_state - return the current safety cutoff state and list of blocked commands
     """
 
     COMPONENT_DEFAULT_NAME: str = 'TreeBlockerAccessGrantor'
 
+    PUSH_DRIVEN: ClassVar[bool] = True
+
     def __init__(self, component_name: str, source_name: str, target_blocker: TreeBaseRequestBlocker, **kwargs):
         super().__init__(component_name=component_name, source_name=source_name, subcontractor=None, **kwargs)
         self._target_blocker: TreeBaseRequestBlocker = target_blocker
+        self._unsubs: List[Callable[[], None]] = []
+
+    def set_change_notifier(self, notify: Callable[[], Awaitable[None]]) -> None:
+        # Drop any prior wiring (idempotent rewire).
+        for unsub in self._unsubs:
+            unsub()
+        self._unsubs = []
+        super().set_change_notifier(notify)
+
+        async def _on_change(_v: bool) -> None:
+            await notify()
+
+        self._unsubs.append(self._target_blocker.subscribe_safety_cutoff_change(_on_change))
 
     async def get_value(self, request: ValueRequest, **kwargs) -> Value or None:
         user = request.user
@@ -97,4 +116,31 @@ class TreeBlockerAccessGrantor(TreeProvider):
             else:
                 return Value(v=False, ts=time.time())
 
-        raise AddressError(code=1002, message=f'Unrecognised method for module {self.get_name()}')
+        if command == 'engage_safety_cutoff' and request_type == 'PUT':
+            self._target_blocker.engage_safety_cutoff()
+            logger.info(f"The user: {user} engaged the safety cutoff.")
+            return Value(v=True, ts=time.time())
+
+        if command == 'disengage_safety_cutoff' and request_type == 'PUT':
+            self._target_blocker.disengage_safety_cutoff()
+            logger.info(f"The user: {user} disengaged the safety cutoff.")
+            return Value(v=True, ts=time.time())
+
+        if command == 'safety_cutoff_state':
+            out = {
+                'engaged': self._target_blocker.is_safety_cutoff_engaged(),
+                'blocked_commands': self._target_blocker.get_safety_cutoff_list(),
+            }
+            return Value(v=out, ts=time.time())
+
+        raise AddressError(code=1002, message=f'Unrecognised method for module {self.get_name()}',
+                           severity=AddressError.SEVERITY_CRITICAL)
+
+    def get_publishable_config(self) -> Optional[dict]:
+        source_name = self.get_source_name()
+        return {
+            "role": "service",
+            "key": source_name,
+            "address": source_name,
+            "type": type(self).__name__,
+        }

@@ -12,6 +12,7 @@ settings:
 components:
   focuser:
     mappings:
+      connected: "POSITION.INSTRUMENTAL.FOCUS.POWER_STATE"
       position: "POINTING.SETUP.FOCUS.POSITION"
       tempcomp: "POINTING.SETUP.FOCUS.TEMPCOMP"
       ismoving: "POINTING.SETUP.FOCUS.ISMOVING"
@@ -34,27 +35,34 @@ components:
   telescope: # 'telescope' jest używane jako standardowa nazwa dla komponentu 'mount'
 #    reading:
     mappings:
-      rightascension: "OBJECT.EQUATORIAL.RA"
-      declination: "OBJECT.EQUATORIAL.DEC"
-      azimuth: "OBJECT.INSTRUMENTAL.AZ"
-      altitude: "OBJECT.INSTRUMENTAL.ALT"
-      athome: "POINTING.STATE.ATHOME"
-      atpark: "POINTING.STATE.ATPARK"
-      slewing: "POINTING.STATE.SLEWING"
+      connected: "POSITION.INSTRUMENTAL.RA.POWER_STATE" #Polecenie dobre, ale wykrzacza się samo "conncted"
+      rightascension: "POSITION.EQUATORIAL.RA_CURRENT"
+      rightascension_move: "OBJECT.EQUATORIAL.RA"
+      declination: "POSITION.EQUATORIAL.DEC_CURRENT"
+      declination_move: "OBJECT.EQUATORIAL.DEC"
+      azimuth: "POSITION.HORIZONTAL.AZ"
+      azimuth_move: "OBJECT.INSTRUMENTAL.AZ"
+      altitude: "POSITION.HORIZONTAL.ALT"
+      altitude_move: "OBJECT.INSTRUMENTAL.ALT"
+      athome: "TELESCOPE.READY_STATE"
+      atpark: "TELESCOPE.READY_STATE"
+      slewing: "TELESCOPE.MOTION_STATE"
       tracking: "POINTING.TRACK"
-      ispulseguiding: "POINTING.STATE.PULSEGUIDING"
-      motorstatus: "MOTORS.STATUS"
-      errorstring: "SYSTEM.ERROR.STRING"
-      sideofpier: "POINTING.STATE.SIDEOFPIER"
+      motorstatus: "TELESCOPE.READY"
+      abortslew: "TELESCOPE.STOP"
+      park: "TELESCOPE.READY" #TO CHANGE
+      motor: "CABINET.POWER" #TO CHANGE
+#      errorstring: "SYSTEM.ERROR.STRING"
+#      sideofpier: "POINTING.STATE.SIDEOFPIER"
     actions:
       slewtocoordinates:
         - variable: "epoch"
           value: 2000.0
         - variable: "equinox"
           value: 2000.0
-        - variable: "rightascension"
+        - variable: "rightascension_move"
           value: "{RightAscension}"
-        - variable: "declination"
+        - variable: "declination_move"
           value: "{Declination}"
         - tracking: "tracking"
           value: 2
@@ -68,9 +76,9 @@ components:
           value: 2000.0
         - variable: "equinox"
           value: 2000.0
-        - variable: "rightascension"
+        - variable: "rightascension_move"
           value: "{RightAscension}"
-        - variable: "declination"
+        - variable: "declination_move"
           value: "{Declination}"
         - tracking: "tracking"
           value: 2
@@ -80,21 +88,21 @@ components:
             tolerance: 0.05
             timeout: 120
       slewtoaltaz:
-        - variable: "azimuth"
+        - variable: "azimuth_move"
           value: "{Azimuth}"
-        - variable: "altitude"
+        - variable: "altitude_move"
           value: "{Altitude}"
         - variable: "tracking"
-          value: 2
+          value: 1
         - verify:
             azimuth: "{Azimuth}"
             altitude: "{Altitude}"
             tolerance: 0.05
             timeout: 120
       slewtoaltazasync:
-        - variable: "azimuth"
+        - variable: "azimuth_move"
           value: "{Azimuth}"
-        - variable: "altitude"
+        - variable: "altitude_move"
           value: "{Altitude}"
         - variable: "tracking"
           value: 2
@@ -103,27 +111,27 @@ components:
             altitude: "{Altitude}"
             tolerance: 0.05
             timeout: 120
+      tracking:
+        - variable: "tracking"
+          value: "{Tracking}"
       abortslew:
-        - variable: "slewing"
-          value: "ABORT"
+        - variable: "abortslew"
+          value: 0
       park:
-        - variable: "atpark"
-          value: "PARK"
+        - variable: "park"
+          value: 0
       unpark:
-        - variable: "atpark"
-          value: "UNPARK"
+        - variable: "park"
+          value: 1
       findhome:
-        - variable: "athome"
-          value: "FINDHOME"
+        - variable: "park"
+          value: 1
       motoron:
-        - variable: "motorstatus"
-          value: "ON"
+        - variable: "motor"
+          value: 1
       motoroff:
-        - variable: "motorstatus"
-          value: "OFF"
-      pulseguide:
-        - variable: "ispulseguiding"
-          value: "{Direction},{Duration}"
+        - variable: "motor"
+          value: 0
 
   rotator:
     reading:
@@ -148,43 +156,27 @@ components:
         - variable: "position"
           value: "SYNC:{Position}"
 
-  covercalibratior:
+  covercalibrator:
     mappings:
-      coverstate: "AUXILIARY.COVER.TARGETPOS"
-      calibratorstate:
-      brightness:
+      coverstate: "AUXILIARY.COVER.REALPOS"
+      covermove: "AUXILIARY.COVER.TARGETPOS"
+#      calibratorstate:
+#      brightness:
     actions:
       opencover:
-        - variable: "coverstate"
+        - variable: "covermove"
           value: "1"
       closecover:
-        - variable: "coverstate"
+        - variable: "covermove"
           value: "0"
-      calibratoron:
-        - variable: "brightness"
-          value: "{Brightness}"
-        - variable: "calibratorstate"
-          value: "ON"
-      calibratoroff:
-        - variable: "calibratorstate"
-          value: "OFF"
-
-### Wersja pierwsza
-#  telescope:
-#    mappings:
-#      rightascension: "OBJECT.EQUATORIAL.RA"
-#      declination: "OBJECT.EQUATORIAL.DEC"
-#      tracking: "POINTING.TRACK"
-#      azimuth: "OBJECT.INSTRUMENTAL.AZ"
-#      altitude: "OBJECT.INSTRUMENTAL.ALT"
-#    actions:
-#      slewtocoordinates:
-#        - variable: "rightascension"
-#          value: "{RightAscension}"
-#        - variable: "declination"
-#          value: "{Declination}"
-#        - variable: "tracking"
-#          value: 1
+#      calibratoron:
+#        - variable: "brightness"
+#          value: "{Brightness}"
+#        - variable: "calibratorstate"
+#          value: "ON"
+#      calibratoroff:
+#        - variable: "calibratorstate"
+#          value: "OFF"
 
 resource_locks:
   "POINTING.SETUP.FOCUS.POSITION": "FOCUSER_MOTOR"

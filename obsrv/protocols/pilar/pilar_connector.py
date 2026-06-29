@@ -7,28 +7,49 @@ import confuse
 
 from obsrv.protocols.alpaca.alpaca_connector import Connector
 from obcom.data_colection.address import AddressError
+from obcom.data_colection.coded_error import TreeOtherError, TreeStructureError
 
 logger = logging.getLogger(__name__.rsplit('.')[-1])
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'pilar_config.yml')
+
+# Socket-level failures that indicate the Pilar link is down / stale.
+# Surfaced as TreeOtherError(4005, NORMAL) so cycle-query subscribers
+# self-recover via ErrorPolicy.SERVICE staged-backoff retries when the
+# device returns. NORMAL (not TEMPORARY) for the same reason iris_ccd
+# uses NORMAL — sustained device-offline state needs operator visibility,
+# not a silent retry-forever inside the cycle-query layer. The pool's
+# self-heal logic already filters single-blip cases before they reach
+# this raise site.
+_TEMPORARY_IO_ERRORS = (ConnectionError, BrokenPipeError, OSError, asyncio.TimeoutError, TimeoutError)
+
 
 class PilarConnection:
     """Reprezentuje pojedyncze, aktywne połączenie TCP z serwerem Pilar."""
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self.reader = reader
         self.writer = writer
+        self.broken = False
 
     async def execute(self, cmd_id: int, command_str: str, timeout: float) -> str:
         """Wysyła komendę i czeka na odpowiedź pasującą do cmd_id."""
         full_command = f"{cmd_id} {command_str}\n"
-        self.writer.write(full_command.encode('utf-8'))
-        await self.writer.drain()
-        
+        try:
+            self.writer.write(full_command.encode('utf-8'))
+            await self.writer.drain()
+        except _TEMPORARY_IO_ERRORS:
+            self.broken = True
+            raise
+
         value_to_return = None
         while True:
-            # Czytamy linię po linii
-            line_bytes = await asyncio.wait_for(self.reader.readline(), timeout=timeout)
+            try:
+                line_bytes = await asyncio.wait_for(self.reader.readline(), timeout=timeout)
+            except _TEMPORARY_IO_ERRORS:
+                self.broken = True
+                raise
             if not line_bytes:
+                self.broken = True
                 raise ConnectionAbortedError("Pilar connection closed unexpectedly.")
             
             response_line = line_bytes.decode('utf-8').strip()
@@ -59,26 +80,39 @@ class PilarConnection:
 
 
 class PilarConnector(Connector):
+    # Wait before reconnecting tries.
+    _RECONNECT_COOLDOWN = 30.0
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._load_config()
-        
+
         # Słowniki przechowujące pule dla poszczególnych adresów (host:port)
         # Klucz: "IP:PORT", Wartość: Kolejka aktywnych obiektów PilarConnection
         self._connection_pools: Dict[str, asyncio.Queue[PilarConnection]] = {}
-        
+
         # Klucz: "IP:PORT", Wartość: Kolejka dostępnych ID transakcji
         self._id_pools: Dict[str, asyncio.Queue[int]] = {}
-        
+
         # Blokady logiczne dla zasobów (np. żeby nie ruszać Focuserem gdy inny wątek nim rusza)
         self._resource_locks: Dict[str, asyncio.Lock] = {
             resource_name: asyncio.Lock() for resource_name in set(self._resource_lock_map.values())
         }
-        
+
         # Blokada techniczna, aby nie tworzyć puli dla tego samego adresu wielokrotnie
-        self._connection_locks: Dict[str, asyncio.Lock] = {} 
-        
+        self._connection_locks: Dict[str, asyncio.Lock] = {}
+
+        self._reconnect_suppressed_until: Dict[str, float] = {}
+        self._outage_logged: Dict[str, bool] = {}
+
         logger.info(f'Pilar advanced connector created with pool size: {self._pool_size}')
+
+    def _is_outage(self, address: str) -> bool:
+        """True while the breaker is open for this address (don't spam per-request logs)."""
+        suppressed_until = self._reconnect_suppressed_until.get(address)
+        if suppressed_until is None:
+            return False
+        return asyncio.get_event_loop().time() < suppressed_until
 
     def _load_config(self):
         logger.info(f"Loading Pilar configuration from: {CONFIG_PATH}")
@@ -96,6 +130,12 @@ class PilarConnector(Connector):
                 "pool_get": config['settings']['timeouts']['pool_get'].get(float),
             }
 
+            try:
+                self._focuser_multiplier = config['settings']['focuser']['multiplier'].get(float)
+            except confuse.NotFoundError:
+                self._focuser_multiplier = 1000.0  # Wartość domyślna w razie braku wpisu w configu
+                logger.warning("No settings.focuser.multiplier in configuration. Use default value: 1000.0")
+            
             self._resource_lock_map = config['resource_locks'].get(dict)
             self._command_map = {}
             self._actions_map = {}
@@ -132,7 +172,7 @@ class PilarConnector(Connector):
                 await writer.start_tls(sc)
             return PilarConnection(reader, writer)
         except Exception as e:
-            logger.error(f"Failed to create a connection to {host}:{port}: {e}")
+            logger.debug(f"Failed to create a connection to {host}:{port}: {e}")
             return None
 
     async def _ensure_connected(self, address: str):
@@ -142,16 +182,24 @@ class PilarConnector(Connector):
         """
         # Szybkie sprawdzenie bez blokady
         if address in self._connection_pools:
-             return True 
-        
+            return True
+
+        # Circuit breaker: don't even try if we recently failed
+        loop_time = asyncio.get_event_loop().time()
+        if loop_time < self._reconnect_suppressed_until.get(address, 0.0):
+            return False
+
         if address not in self._connection_locks:
             self._connection_locks[address] = asyncio.Lock()
-        
+
         async with self._connection_locks[address]:
             # Ponowne sprawdzenie pod blokadą (double-check locking pattern)
             if address in self._connection_pools:
-                 return True 
-            
+                return True
+            loop_time = asyncio.get_event_loop().time()
+            if loop_time < self._reconnect_suppressed_until.get(address, 0.0):
+                return False
+
             try:
                 host, port_str = address.split(':')
                 port = int(port_str)
@@ -159,13 +207,14 @@ class PilarConnector(Connector):
                 logger.error(f"Invalid Pilar address format: {address}. Expected host:port")
                 raise AddressError(address, 1003, "Invalid address format")
 
-            logger.info(f"Initializing connection pool for {address} (Size: {self._pool_size})...")
-            
-            # 1. Przygotowanie puli ID
-            id_pool = asyncio.Queue()
-            for i in range(self._id_range[0], self._id_range[1] + 1):
-                id_pool.put_nowait(i)
-            self._id_pools[address] = id_pool
+            # ID pool persists across reconnect tries — only build it once
+            if address not in self._id_pools:
+                logger.info(f"Initializing connection pool for {address} (Size: {self._pool_size})...")
+                # 1. Przygotowanie puli ID
+                id_pool = asyncio.Queue()
+                for i in range(self._id_range[0], self._id_range[1] + 1):
+                    id_pool.put_nowait(i)
+                self._id_pools[address] = id_pool
 
             # 2. Nawiązywanie wielu połączeń równolegle
             creation_tasks = [self._create_single_connection(host, port) for _ in range(self._pool_size)]
@@ -178,35 +227,74 @@ class PilarConnector(Connector):
                 if conn:
                     conn_pool.put_nowait(conn)
                     active_count += 1
-            
+
             if active_count > 0:
                 self._connection_pools[address] = conn_pool
-                logger.info(f"Pilar connector connected to {address}. Active connections: {active_count}")
+                if self._outage_logged.pop(address, False):
+                    logger.warning(
+                        f"Pilar at {address} reconnected. Active connections: {active_count}"
+                    )
+                else:
+                    logger.info(
+                        f"Pilar connector connected to {address}. Active connections: {active_count}"
+                    )
+                self._reconnect_suppressed_until.pop(address, None)
                 return True
-            else:
-                logger.error(f"Failed to connect to Pilar at {address} (0 connections established).")
-                return False
+
+            # All attempts failed — open the breaker and log once per outage
+            self._reconnect_suppressed_until[address] = loop_time + self._RECONNECT_COOLDOWN
+            if not self._outage_logged.get(address, False):
+                logger.error(
+                    f"Pilar at {address} unreachable (0/{self._pool_size} connections established); "
+                    f"suppressing further attempts and per-request errors for "
+                    f"{self._RECONNECT_COOLDOWN:.0f}s."
+                )
+                self._outage_logged[address] = True
+            return False
 
     async def _get_connection_resources(self, address):
         """Pobiera jedno z wolnych połączeń i wolny ID z puli."""
-        await self._ensure_connected(address)
+        connected = await self._ensure_connected(address)
+        if not connected:
+            # Either breaker is open or this attempt just failed. Surface as a
+            # connection-class error so the caller's `_TEMPORARY_IO_ERRORS`
+            # branch translates it to TreeOtherError(4005, NORMAL) without
+            # an ERROR log here.
+            raise ConnectionError(f"Pilar at {address} not reachable")
         try:
             id_pool = self._id_pools[address]
             conn_pool = self._connection_pools[address]
-            
+
             # Czekamy na dostępność ID i Połączenia
             # Dzięki temu wiele zapytań może działać równolegle, dopóki są wolne sockety
             cmd_id = await asyncio.wait_for(id_pool.get(), timeout=self._timeouts['pool_get'])
             conn = await asyncio.wait_for(conn_pool.get(), timeout=self._timeouts['pool_get'])
             return conn, cmd_id
         except (KeyError, asyncio.TimeoutError):
-             raise TimeoutError(f"No available connection or ID in the pool for {address}.")
+            raise TimeoutError(f"No available connection or ID in the pool for {address}.")
 
     async def _return_connection_resources(self, address, conn, cmd_id):
-        """Zwraca zasoby do puli po zakończeniu komendy."""
-        if address in self._connection_pools:
+        """Zwraca zasoby do puli po zakończeniu komendy.
+        Zepsute połączenia (broken pipe, reset) są zamykane i zastępowane świeżymi,
+        żeby pula sama się leczyła po restartcie Pilara / idle-timeoucie sieci.
+        """
+        if address not in self._connection_pools:
+            return
+        if conn.broken:
+            try:
+                conn.writer.close()
+            except Exception:
+                pass
+            try:
+                host, port_str = address.split(':')
+                replacement = await self._create_single_connection(host, int(port_str))
+            except Exception:
+                replacement = None
+            if replacement is not None:
+                await self._connection_pools[address].put(replacement)
+        else:
             await self._connection_pools[address].put(conn)
-            await self._id_pools[address].put(cmd_id)
+        await self._id_pools[address].put(cmd_id)
 
     async def _get_address(self, component):
         return component.get_option_recursive('address')
@@ -218,34 +306,68 @@ class PilarConnector(Connector):
 
         try:
             pilar_cmd = self._command_map[component.kind][variable]
+        except KeyError:
+            raise TreeStructureError(
+                code=3002,
+                message=f"Method {variable!r} is not implemented on {component.kind}",
+                severity=TreeStructureError.SEVERITY_CRITICAL,
+            ) from None
+
+        try:
             command = f"GET {pilar_cmd}"
-            
+
             # Pobierz zasoby (to tu następuje zrównoleglenie - różne wątki dostają różne conn)
             conn, cmd_id = await self._get_connection_resources(address)
             try:
-                return await conn.execute(cmd_id, command, timeout=self._timeouts['get'])
+                result = await conn.execute(cmd_id, command, timeout=self._timeouts['get'])
+                if component.kind == 'focuser' and variable == 'position':
+                    if isinstance(result, (int, float)):
+                        # Używamy round() przed int(), aby uniknąć błędów precyzji float
+                        # np. 25.123 * 1000 = 25122.9999999 -> bez round wyszłoby 25122
+                        result = int(round(result * self._focuser_multiplier))
+
+                return result
             finally:
                 await self._return_connection_resources(address, conn, cmd_id)
+        except _TEMPORARY_IO_ERRORS as e:
+            if not self._is_outage(address):
+                logger.warning(f"Pilar not responding at {address} ({component.kind}.{variable}): {e}")
+            raise TreeOtherError(address=None, code=4005,
+                                 message=f"Pilar not responding at {address}",
+                                 severity=TreeOtherError.SEVERITY_NORMAL) from e
         except Exception as e:
             logger.error(f"Pilar GET failed for {component.kind}.{variable} at {address}: {e}")
-            return None
+            raise
 
     async def put(self, component: 'Component', variable: str, kind=None, **data):
         address = await self._get_address(component)
         if not address:
              raise ValueError(f"No address configured for component {component.sys_id}")
 
-        try:
-            # --- DODANY KOD: Automatyczne przekierowanie akcji (np. slewtoaltaz) do metody call ---
-            if component.kind in self._actions_map and variable in self._actions_map[component.kind]:
-                logger.info(f"Przekierowuje PUT '{variable}' do CALL, poniewaz jest zdefiniowane jako akcja.")
-                return await self.call(component, variable, **data)
-            # --------------------------------------------------------------------------------------
+        # Automatically redirect actions (e.g. slewtoaltaz) to the call method
+        if component.kind in self._actions_map and variable in self._actions_map[component.kind]:
+            logger.info(f"Redirecting PUT '{variable}' to CALL because it is defined as an action.")
+            return await self.call(component, variable, **data)
 
+        try:
             pilar_cmd = self._command_map[component.kind][variable]
+        except KeyError:
+            raise TreeStructureError(
+                code=3002,
+                message=f"Method {variable!r} is not implemented on {component.kind}",
+                severity=TreeStructureError.SEVERITY_CRITICAL,
+            ) from None
+
+        try:
             if not data:
                 return {"status": "failed", "error": "Missing input value."}
             value = list(data.values())[0]
+            if component.kind == 'focuser' and variable == 'position':
+                try:
+                    # Convert to float, divide and round for safety
+                    value = round(float(value) / self._focuser_multiplier, 4)
+                except (ValueError, TypeError):
+                    pass  # If the client sent garbage like a string "START", leave it as-is; Pilar will raise an error
             command = f"SET {pilar_cmd}={value}"
             
             resource_name = self._resource_lock_map.get(pilar_cmd)
@@ -258,8 +380,8 @@ class PilarConnector(Connector):
                 finally:
                     await self._return_connection_resources(address, conn, cmd_id)
 
-            # Jeśli komenda wymaga wyłączności (np. ruch teleskopu), używamy logicznej blokady
-            # Inne komendy (np. zapalenie lampy) mogą iść równolegle
+            # If the command requires exclusive access (e.g. telescope slew), use a logical lock.
+            # Other commands (e.g. lamp on) can run in parallel.
             if lock:
                 async with lock:
                     await _do_put()
@@ -267,6 +389,12 @@ class PilarConnector(Connector):
                 await _do_put()
                 
             return {"status": "ok", "value_set": value}
+        except _TEMPORARY_IO_ERRORS as e:
+            if not self._is_outage(address):
+                logger.warning(f"Pilar not responding at {address} ({component.kind}.{variable}): {e}")
+            raise TreeOtherError(address=None, code=4005,
+                                 message=f"Pilar not responding at {address}",
+                                 severity=TreeOtherError.SEVERITY_NORMAL) from e
         except Exception as e:
             logger.error(f"Pilar PUT failed for {component.kind}.{variable}: {e}")
             return {"status": "failed", "error": str(e)}

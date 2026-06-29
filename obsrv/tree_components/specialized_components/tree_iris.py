@@ -3,6 +3,7 @@ TreeIrisObservatory - Tree adapter for IRIS Observatory.
 """
 import logging
 import time
+from typing import Optional
 
 from obcom.data_colection.address import AddressError
 from obcom.data_colection.coded_error import BaseCodedError
@@ -10,6 +11,7 @@ from obcom.data_colection.value import Value, TreeValueError
 from obcom.data_colection.value_call import ValueRequest
 
 from obsrv.tree_components.base_components.tree_base_provider import TreeBaseProvider
+from obsrv.tree_components.specialized_components.tree_conditional_freezer import strip_tree_internal_fields
 from obsrv.telescope_devices.device_tree import Observatory
 from obsrv.utils.asyncio_util_functions import wait_for_psce
 
@@ -64,7 +66,7 @@ class TreeIrisObservatory(TreeBaseProvider):
         index = request.index
         iris_address = address[index:].copy()
         request_type = request.request_type
-        request_arguments = request.request_data
+        request_arguments = strip_tree_internal_fields(request.request_data)
         request_timeout = request.request_timeout
 
         if len(iris_address) <= 0:
@@ -94,7 +96,8 @@ class TreeIrisObservatory(TreeBaseProvider):
             return Value(result, time.time())
             
         except KeyError:
-            raise AddressError(address=address, code=1002, message="Observatory component not found")
+            raise AddressError(address=address, code=1002, message="Observatory component not found",
+                               severity=AddressError.SEVERITY_CRITICAL)
         except BaseCodedError:
             raise
         except Exception as e:
@@ -116,3 +119,12 @@ class TreeIrisObservatory(TreeBaseProvider):
             out.get(self.get_name()).get("config").update({"observatory_config": obs_cfg})
             out.get(self.get_name()).get("config").update({"observatory_config_name": self.observatory_name})
         return out
+
+    def get_publishable_config(self) -> Optional[dict]:
+        if not self._observatory:
+            return None
+        return {
+            "role": "observatory",
+            "observatory_config_name": self.observatory_name,
+            "observatory": self._observatory.observatory_configuration_rare,
+        }

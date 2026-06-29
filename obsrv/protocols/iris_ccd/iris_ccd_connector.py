@@ -1,14 +1,21 @@
 import asyncio
 import logging
 import os
+import json
 from typing import Iterable, Callable, Tuple, Dict
 import confuse
+import nats
 
 from obsrv.protocols.alpaca.alpaca_connector import Connector
+from obcom.data_colection.coded_error import TreeOtherError, TreeStructureError
+from obcom.data_colection.value import TreeValueError
 
 logger = logging.getLogger(__name__.rsplit('.')[-1])
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), 'iris_ccd_config.yml')
+
+_TEMPORARY_IO_ERRORS = (ConnectionError, BrokenPipeError, OSError,
+                        asyncio.TimeoutError, TimeoutError)
 
 class IrisCcdProtocol(asyncio.DatagramProtocol):
     def __init__(self, response_future: asyncio.Future):
@@ -35,8 +42,14 @@ class IrisCcdConnector(Connector):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._load_config()
-        self._endpoints = {} # Map: address -> (transport, protocol)
-        self._locks = {}     # Map: address -> asyncio.Lock
+        self._endpoints = {} 
+        self._locks = {}     
+        
+        self._nats_nc = None
+        self._nats_connected = False
+        self._nats_lock = asyncio.Lock()
+        self._nats_data = {}
+        
         logger.info('IrisCcdConnector created')
 
     def _load_config(self):
@@ -48,10 +61,60 @@ class IrisCcdConnector(Connector):
             self._timeout = config['settings']['command_timeout'].get(float)
             self._command_map = config['mappings']['commands'].get(dict)
             self._actions_map = config['mappings']['actions'].get(dict)
+            
+            self._nats_url = config['settings']['nats_url'].get(str)
+            self._nats_subject = config['settings']['nats_subject'].get(str)
+            self._nats_map = self._command_map.get('nats', {})
+            
             logger.info("IRIS CCD configuration loaded successfully.")
         except (confuse.ConfigReadError, FileNotFoundError) as e:
             logger.error(f"CRITICAL: Could not read IRIS CCD config file. Error: {e}")
             raise RuntimeError("IRIS CCD connector configuration is missing or corrupted.") from e
+
+    async def _nats_message_handler(self, msg):
+        try:
+            payload = json.loads(msg.data.decode('utf-8'))
+            measurements = payload.get("data", {}).get("measurements", {})
+            
+            for var_name, var_conf in self._nats_map.items():
+                expected_subject = var_conf.get('subject', self._nats_subject)
+                
+                if msg.subject == expected_subject:
+                    key = var_conf.get('key')
+                    if key and key in measurements:
+                        self._nats_data[var_name] = float(measurements[key])
+                        logger.debug(f"NATS [{msg.subject}]: Update '{var_name}' with key '{key}' -> {self._nats_data[var_name]}")
+                        
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding JSON from NATS: {e}")
+        except ValueError as e:
+            logger.error(f"Error converting NATS value to float: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error while parsing NATS telemetry: {e}")
+
+    async def _ensure_nats_connected(self):
+        async with self._nats_lock:
+            if not self._nats_connected:
+                try:
+                    self._nats_nc = await nats.connect(self._nats_url)
+                    
+                    subjects_to_subscribe = set()
+                    if self._nats_subject:
+                        subjects_to_subscribe.add(self._nats_subject)
+                    for var_conf in self._nats_map.values():
+                        sub = var_conf.get('subject', self._nats_subject)
+                        if sub:
+                            subjects_to_subscribe.add(sub)
+                    
+                    for sub in subjects_to_subscribe:
+                        await self._nats_nc.subscribe(sub, cb=self._nats_message_handler)
+                        logger.info(f"NATS: Subscribed to subject: {sub}")
+                        
+                    self._nats_connected = True
+                    logger.info(f"Successfully connected to NATS server ({self._nats_url})")
+                except Exception as e:
+                    logger.error(f"Error connecting to NATS: {e}")
+                    raise
 
     async def _get_endpoint(self, address: str):
         if address not in self._locks:
@@ -65,7 +128,6 @@ class IrisCcdConnector(Connector):
                 host, port_str = address.split(':')
                 port = int(port_str)
                 loop = asyncio.get_running_loop()
-                # Create a protocol with a dummy future initially
                 protocol = IrisCcdProtocol(asyncio.Future())
                 transport, protocol = await loop.create_datagram_endpoint(
                     lambda: protocol,
@@ -79,19 +141,15 @@ class IrisCcdConnector(Connector):
                 raise
 
     async def _execute_command(self, address: str, command_str: str) -> str:
-        # Get endpoint first to ensure locks are created
         transport, protocol = await self._get_endpoint(address)
         
-        # Lock per address to ensure sequential request-response on the same socket
         async with self._locks[address]:
             if not transport or transport.is_closing():
-                 # Reconnect logic if needed, simplistically removing from cache
                  if address in self._endpoints: del self._endpoints[address]
                  transport, protocol = await self._get_endpoint(address)
 
             try:
                 response_future = asyncio.get_running_loop().create_future()
-                # Update future in the protocol instance
                 protocol.response_future = response_future
                 
                 command_bytes = command_str.encode('utf-8')
@@ -105,7 +163,6 @@ class IrisCcdConnector(Connector):
                 logger.debug(f"IRIS CCD IN ({address}) <<< {response}")
 
                 if "OKAY" in response:
-                    # Znajdujemy pozycję słowa OKAY i zwracamy wszystko, co po nim występuje
                     index = response.find("OKAY")
                     return response[index + 4:].strip()
                 else:
@@ -113,7 +170,6 @@ class IrisCcdConnector(Connector):
 
             except asyncio.TimeoutError:
                 logger.error(f"IRIS CCD command '{command_str}' timed out.")
-                # Force reconnect on timeout to be safe
                 if address in self._endpoints: del self._endpoints[address]
                 raise TimeoutError("IRIS CCD did not respond in time.")
             except Exception as e:
@@ -121,6 +177,21 @@ class IrisCcdConnector(Connector):
                 raise
 
     async def get(self, component: 'Component', variable: str, kind=None, **data):
+        if variable in self._nats_map:
+            try:
+                await self._ensure_nats_connected()
+            except Exception as e:
+                raise TreeOtherError(address=None, code=4005,
+                                     message=f"NATS connection failed: {e}",
+                                     severity=TreeOtherError.SEVERITY_NORMAL) from e
+                                     
+            if variable not in self._nats_data:
+                raise TreeOtherError(address=None, code=4005,
+                                     message=f"NATS telemetry received no data for {variable!r} yet.",
+                                     severity=TreeOtherError.SEVERITY_NORMAL)
+                                     
+            return self._nats_data[variable]
+
         address = component.get_option_recursive('address')
         if not address:
              logger.error(f"No address for component {component.sys_id}")
@@ -128,39 +199,48 @@ class IrisCcdConnector(Connector):
              
         try:
             command_def = self._command_map[component.kind][variable]
-            command_base = command_def['command']
+        except KeyError:
+            raise TreeStructureError(
+                code=3002,
+                message=f"Method {variable!r} is not implemented on {component.kind}",
+                severity=TreeStructureError.SEVERITY_CRITICAL,
+            ) from None
+
+        try:
+            command_base = command_def.get('command')
+            if command_base is None:
+                raise TreeStructureError(
+                    code=3002,
+                    message=f"Malformed command definition for {variable!r} on {component.kind}: missing 'command' key",
+                    severity=TreeStructureError.SEVERITY_CRITICAL,
+                )
             get_arg = command_def.get('get_arg')
             if get_arg:
                 command = f"{command_base} {get_arg}"
             else:
                 command = command_base
             
-            # 1. Pobieramy surowy tekst z kamery
             raw_response = await self._execute_command(address, command)
             
-            # 2. TŁUMACZENIE STANU KAMERY NA STANDARD ALPACA
             if component.kind == 'camera' and variable == 'camerastate':
                 resp_upper = raw_response.upper()
-                if "EXPOS" in resp_upper:
-                    return 2  # CameraExposing
-                elif "WAIT" in resp_upper:
-                    return 1  # CameraWaiting
-                elif "READ" in resp_upper:
-                    return 3  # CameraReading
-                elif "DOWNLOAD" in resp_upper:
-                    return 4  # CameraDownload
-                elif "ERROR" in resp_upper or "FAIL" in resp_upper:
-                    return 5  # CameraError
-                else:
-                    # Dla "OK" i wszelkich innych statusów spoczynkowych
-                    return 0  # CameraIdle
+                if "EXPOS" in resp_upper: return 2
+                elif "WAIT" in resp_upper: return 1
+                elif "READ" in resp_upper: return 3
+                elif "DOWNLOAD" in resp_upper: return 4
+                elif "ERROR" in resp_upper or "FAIL" in resp_upper: return 5
+                else: return 0
             
-            # 3. Zwracamy odpowiedź (jeśli to nie jest camerastate, zwróci tekst)
             return raw_response
-            
-        except (KeyError, TimeoutError, ConnectionError, RuntimeError) as e:
-            logger.error(f"IRIS CCD GET failed for {component.kind}.{variable}: {e}")
-            return None
+
+        except _TEMPORARY_IO_ERRORS as e:
+            raise TreeOtherError(address=None, code=4005,
+                                 message=f"IRIS CCD unreachable on GET {component.kind}.{variable}: {e}",
+                                 severity=TreeOtherError.SEVERITY_NORMAL) from e
+        except RuntimeError as e:
+            raise TreeValueError(address=None, code=2002,
+                                 message=f"IRIS CCD device error on GET {component.kind}.{variable}: {e}",
+                                 severity=TreeValueError.SEVERITY_NORMAL) from e
 
     async def put(self, component: 'Component', variable: str, kind=None, **data):
         address = component.get_option_recursive('address')
@@ -169,16 +249,35 @@ class IrisCcdConnector(Connector):
 
         try:
             command_def = self._command_map[component.kind][variable]
-            command_base = command_def['command']
+        except KeyError:
+            raise TreeStructureError(
+                code=3002,
+                message=f"Method {variable!r} is not implemented on {component.kind}",
+                severity=TreeStructureError.SEVERITY_CRITICAL,
+            ) from None
+
+        try:
+            command_base = command_def.get('command')
+            if command_base is None:
+                raise TreeStructureError(
+                    code=3002,
+                    message=f"Malformed command definition for {variable!r} on {component.kind}: missing 'command' key",
+                    severity=TreeStructureError.SEVERITY_CRITICAL,
+                )
             if not data:
                 return {"status": "failed", "error": "Missing input value."}
             value = list(data.values())[0]
             command = f"{command_base} {value}"
             response = await self._execute_command(address, command)
             return {"status": "ok", "response": response}
-        except (KeyError, TimeoutError, ConnectionError, RuntimeError) as e:
-            logger.error(f"IRIS CCD PUT failed for {component.kind}.{variable}: {e}")
-            return {"status": "failed", "error": str(e)}
+        except _TEMPORARY_IO_ERRORS as e:
+            raise TreeOtherError(address=None, code=4005,
+                                 message=f"IRIS CCD unreachable on PUT {component.kind}.{variable}: {e}",
+                                 severity=TreeOtherError.SEVERITY_NORMAL) from e
+        except RuntimeError as e:
+            raise TreeValueError(address=None, code=2002,
+                                 message=f"IRIS CCD device error on PUT {component.kind}.{variable}: {e}",
+                                 severity=TreeValueError.SEVERITY_NORMAL) from e
 
     async def call(self, component: 'Component', function: str, **data):
         address = component.get_option_recursive('address')
@@ -208,9 +307,14 @@ class IrisCcdConnector(Connector):
                 
                 last_response = await self._execute_command(address, command)
             return {"status": f"action_{function}_completed", "response": last_response}
-        except Exception as e:
-            logger.error(f"IRIS CCD CALL failed for action {function}: {e}")
-            return {"status": "failed", "error": str(e)}
+        except _TEMPORARY_IO_ERRORS as e:
+            raise TreeOtherError(address=None, code=4005,
+                                 message=f"IRIS CCD unreachable on CALL {function}: {e}",
+                                 severity=TreeOtherError.SEVERITY_NORMAL) from e
+        except RuntimeError as e:
+            raise TreeValueError(address=None, code=2002,
+                                 message=f"IRIS CCD device error on CALL {function}: {e}",
+                                 severity=TreeValueError.SEVERITY_NORMAL) from e
 
     async def subscribe(self, variables: Iterable[Tuple[str, str]], callback: Callable):
         pass
